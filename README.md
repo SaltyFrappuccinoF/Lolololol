@@ -13,5 +13,6 @@
 
 ```Print (Hello World)```
 
-![]()https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSmz8ds9-LtMeYi4izCqwld0ENcc4UyXPAM15MMxDtPog&s=10
+![](https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSmz8ds9-LtMeYi4izCqwld0ENcc4UyXPAM15MMxDtPog&s=10)
 
+```сильно```
