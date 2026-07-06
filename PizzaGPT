@@ -1,0 +1,228 @@
+import os
+import json
+import operator
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+
+# --- Настройка LLM ---
+# Если API выдаст ошибку, что модель не найдена, попробуйте заменить на "gemini-1.5-flash-latest"
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite-preview",
+    temperature=0.7,
+    google_api_key=os.environ.get("GOOGLE_API_KEY")
+)
+
+# --- Определение состояния графа ---
+class PizzaState(TypedDict):
+    messages: Annotated[List[BaseMessage], operator.add]
+    preferences: Optional[Dict[str, Any]]
+    preferences_complete: bool
+    selected_pizza: Optional[str]
+    order_confirmed: bool
+    order_placed: bool
+
+# --- Инструменты (Tools) ---
+# Инструменты позволяют LLM структурированно передавать данные в состояние графа
+def submit_preferences(preferences: Dict[str, Any]) -> str:
+    """Вызывается ТОЛЬКО когда собраны ВСЕ предпочтения пользователя (размер, тесто, аллергии, начинки, адрес и т.д.)."""
+    return "Предпочтения сохранены."
+
+def confirm_selection(selected_pizza: str) -> str:
+    """Вызывается, когда пользователь выбрал конкретную пиццу из предложенных."""
+    return f"Выбор подтвержден: {selected_pizza}"
+
+def place_order() -> str:
+    """Вызывается ТОЛЬКО после явного подтверждения пользователя, что он доволен выбором."""
+    return "Заказ успешно оформлен!"
+
+tools = [submit_preferences, confirm_selection, place_order]
+llm_with_tools = llm.bind_tools(tools)
+
+# --- Системные промпты ---
+SYSTEM_PROMPT_GATHER = """Ты — PizzaGPT, добрый и заботливый ИИ-агент по подбору и заказу пиццы.
+Твоя текущая задача — собрать предпочтения пользователя.
+Правила:
+1. Ты СТРОГО ОБЯЗАН отвечать на русском языке.
+2. Ты НЕ ДОЛЖЕН использовать ни одного эмодзи.
+3. Ты должен давать полные, развернутые ответы и отвечать строго по пунктам.
+4. Ты НЕ ИМЕЕШЬ ПРАВА предлагать пиццы или обсуждать меню, пока не соберешь ВСЕ предпочтения.
+5. Тебе необходимо выяснить: размер пиццы, тип теста, диетические ограничения (веган, вегетарианец, без глютена), аллергии, любимые начинки, нелюбимые начинки, адрес доставки и контактные данные.
+6. Вежливо и подробно расспрашивай пользователя по пунктам, если какой-то информации не хватает.
+7. Как только ты соберешь АБСОЛЮТНО ВСЮ необходимую информацию, ты ОБЯЗАН вызвать инструмент `submit_preferences`, передав туда собранные данные в виде словаря.
+"""
+
+SYSTEM_PROMPT_RECOMMEND = """Ты — PizzaGPT. Предпочтения пользователя успешно собраны.
+Собранные предпочтения: {preferences}
+Правила:
+1. Отвечай на русском языке.
+2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать эмодзи.
+3. Отвечай полно и строго по пунктам.
+4. Предложи ровно 3 варианта пиццы, которые ИДЕАЛЬНО подходят под собранные предпочтения. 
+5. ЗАПРЕЩЕНО предлагать пиццы, которые содержат нелюбимые ингредиенты, аллергены или нарушают диетические ограничения пользователя.
+6. Обоснуй по пунктам, почему каждая из предложенных пицц идеально подходит пользователю.
+7. Спроси пользователя, хочет ли он выбрать одну из них, или попроси предложить другие варианты.
+8. Когда пользователь окончательно выберет конкретную пиццу, ты ОБЯЗАН вызвать инструмент `confirm_selection`, передав туда точное название выбранной пиццы.
+"""
+
+SYSTEM_PROMPT_CONFIRM = """Ты — PizzaGPT. Пользователь выбрал пиццу.
+Выбранная пицца: {selected_pizza}
+Собранные предпочтения и данные: {preferences}
+Правила:
+1. Отвечай на русском языке.
+2. ЗАПРЕЩЕНО использовать эмодзи.
+3. Составь подробное резюме заказа строго по пунктам (детали пиццы, размер, тесто, адрес доставки, контакты).
+4. Спроси пользователя, полностью ли он доволен выбранным вариантом и готов ли подтвердить заказ.
+5. НЕ ОФОРМЛЯЙ заказ, пока пользователь явно и недвусмысленно подтвердит, что он доволен выбором.
+6. Как только пользователь явно подтвердит заказ, вызови инструмент `place_order`.
+"""
+
+# --- Узлы графа (Nodes) ---
+def chatbot_node(state: PizzaState):
+    messages = state["messages"]
+    
+    # Определяем этап диалога и выбираем соответствующий системный промпт
+    if not state.get("preferences_complete"):
+        sys_prompt = SYSTEM_PROMPT_GATHER
+    elif not state.get("order_confirmed"):
+        if state.get("selected_pizza"):
+            sys_prompt = SYSTEM_PROMPT_CONFIRM.replace(
+                "{selected_pizza}", str(state["selected_pizza"])
+            ).replace(
+                "{preferences}", str(state.get("preferences", {}))
+            )
+        else:
+            sys_prompt = SYSTEM_PROMPT_RECOMMEND.replace(
+                "{preferences}", str(state.get("preferences", {}))
+            )
+    else:
+        return {"messages": [AIMessage(content="Ваш заказ уже оформлен и готовится! Спасибо, что выбрали PizzaGPT.")]}
+
+    # Формируем историю сообщений для LLM
+    prompt_messages = [SystemMessage(content=sys_prompt)] + messages
+    response = llm_with_tools.invoke(prompt_messages)
+    
+    return {"messages": [response]}
+
+def tools_node(state: PizzaState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    updates = {"messages": []}
+    
+    # Обрабатываем вызовы инструментов от LLM и обновляем состояние графа
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        
+        if tool_name == "submit_preferences":
+            updates["preferences"] = tool_args["preferences"]
+            updates["preferences_complete"] = True
+            tool_msg = ToolMessage(content="Предпочтения успешно переданы в систему. Теперь ты можешь предложить пиццы.", tool_call_id=tool_call["id"])
+            updates["messages"].append(tool_msg)
+            
+        elif tool_name == "confirm_selection":
+            updates["selected_pizza"] = tool_args["selected_pizza"]
+            tool_msg = ToolMessage(content="Выбор пиццы сохранен. Теперь подтверди детали заказа у пользователя.", tool_call_id=tool_call["id"])
+            updates["messages"].append(tool_msg)
+            
+        elif tool_name == "place_order":
+            updates["order_confirmed"] = True
+            updates["order_placed"] = True
+            tool_msg = ToolMessage(content="Заказ успешно оформлен.", tool_call_id=tool_call["id"])
+            updates["messages"].append(tool_msg)
+            
+    return updates
+
+# --- Функции маршрутизации (Routing) ---
+def should_continue(state: PizzaState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # Если LLM вызвала инструмент, идем в узел tools
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    
+    # Иначе ждем ввода пользователя (конец итерации графа)
+    return "end"
+
+def route_after_tools(state: PizzaState):
+    # Если заказ оформлен, завершаем работу графа
+    if state.get("order_placed"):
+        return "end"
+    # Иначе возвращаемся к чат-боту для дальнейшего диалога
+    return "chatbot"
+
+# --- Построение графа (Graph Construction) ---
+workflow = StateGraph(PizzaState)
+
+# Добавляем узлы
+workflow.add_node("chatbot", chatbot_node)
+workflow.add_node("tools", tools_node)
+
+# Точка входа
+workflow.set_entry_point("chatbot")
+
+# Маршрутизация от чат-бота
+workflow.add_conditional_edges(
+    "chatbot",
+    should_continue,
+    {
+        "tools": "tools",
+        "end": END
+    }
+)
+
+# Маршрутизация после выполнения инструментов
+workflow.add_conditional_edges(
+    "tools",
+    route_after_tools,
+    {
+        "chatbot": "chatbot",
+        "end": END
+    }
+)
+
+# Компиляция графа
+app = workflow.compile()
+
+# --- Интерактивный запуск в терминале ---
+if __name__ == "__main__":
+    print("Добро пожаловать в PizzaGPT!")
+    print("Агент работает в текстовом режиме без использования эмодзи.")
+    print("Для завершения диалога введите 'выход' или 'отмена'.\n")
+    
+    # Начальное состояние
+    state = {
+        "messages": [HumanMessage(content="Привет! Я хочу заказать пиццу.")],
+        "preferences": {},
+        "preferences_complete": False,
+        "selected_pizza": "",
+        "order_confirmed": False,
+        "order_placed": False
+    }
+    
+    # Цикл общения
+    while True:
+        # Выполняем шаг графа (бот думает и отвечает)
+        state = app.invoke(state)
+        
+        # Выводим последнее сообщение от ИИ
+        last_message = state["messages"][-1]
+        if isinstance(last_message, AIMessage) and last_message.content:
+            print(f"\nPizzaGPT:\n{last_message.content}")
+            
+        # Проверка на успешное завершение заказа
+        if state.get("order_placed"):
+            print("\nPizzaGPT: Ваш заказ успешно оформлен! Пицца уже готовится и скоро будет у вас. Спасибо, что использовали PizzaGPT. Хорошего дня!")
+            break
+            
+        # Запрашиваем следующий ввод пользователя
+        user_input = input("\nВы: ")
+        if user_input.lower() in ["выход", "отмена"]:
+            print("Заказ отменен. До свидания!")
+            break
+            
+        # Добавляем сообщение пользователя в историю и продолжаем цикл
+        state["messages"].append(HumanMessage(content=user_input))
