@@ -22,7 +22,7 @@ if not API_KEY:
 
 llm = ChatGoogleGenerativeAI(
     model=MODEL_NAME,
-    google_api_key=API_KEY,
+    google_api_key=sk-aitunnel-6nSOCdFD2jUgDD3fzNwfJtqFbtQl8BaL
     temperature=0.2 # Низкая температура для строгого следования инструкциям
 )
 
