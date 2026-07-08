@@ -1,0 +1,7 @@
+flask
+langgraph
+langchain
+langchain-openai
+mcp
+pydantic
+openai
